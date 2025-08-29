@@ -1256,6 +1256,33 @@ class TelegramBot:
         )
         await update.message.reply_text(help_text)
     
+    async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Команда /start — предлагает выбор типа торговли"""
+        keyboard = [[
+            InlineKeyboardButton("ОТС (Бинарные опционы)", callback_data="otc"),
+            InlineKeyboardButton("Обычная торговля", callback_data="regular")
+        ]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        if update.message:
+            await update.message.reply_text(
+                "📈 *Выберите тип торговли:*",
+                reply_markup=reply_markup,
+                parse_mode='Markdown'
+            )
+        else:
+            # fallback для callback
+            await self.application.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="📈 *Выберите тип торговли:*",
+                reply_markup=reply_markup,
+                parse_mode='Markdown'
+            )
+        return TRADE_TYPE
+
+    async def start_analysis(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Команда /analyze — аналог /start, начинает выбор типа торговли"""
+        return await self.start_command(update, context)
+    
     def run(self):
         """Запуск бота"""
         logger.info("Бот запущен")
