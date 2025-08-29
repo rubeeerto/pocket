@@ -618,7 +618,8 @@ class TechnicalAnalyzer:
 
 PO_FOREX_SYMBOLS = {
     'EUR/USD', 'GBP/USD', 'USD/JPY', 'AUD/USD', 'NZD/USD', 'USD/CAD', 'USD/CHF',
-    'AUD/JPY', 'EUR/JPY', 'GBP/JPY', 'CAD/JPY', 'CHF/JPY'
+    'EUR/JPY', 'GBP/JPY', 'AUD/JPY', 'CAD/JPY', 'CHF/JPY',
+    'EUR/CAD'
 }
 # Нормализованный вид разрешенных форекс-пар (без разделителей)
 PO_FOREX_SYMBOLS_NORMALIZED = {s.replace('/', '').upper() for s in PO_FOREX_SYMBOLS}
@@ -648,114 +649,35 @@ class TelegramBot:
         self.images_path = "images/"
         # Задачи анализа по user_id
         self.analysis_tasks = {}
+        # Доступные пары (динамически)
+        self.available_symbols = set()
         # Проверка всех валютных пар при старте
-        self.analyzer.check_all_symbols()
+        self.refresh_symbols()
     
-    def setup_handlers(self):
-        """Настройка обработчиков команд"""
-        
-        # Обработчик для отмены анализа во время выполнения (должен быть ПЕРЕД ConversationHandler)
-        self.application.add_handler(CallbackQueryHandler(self.cancel_analysis_during, pattern="^cancel_analysis$"))
-        # Кнопки переключения подробностей
-        self.application.add_handler(CallbackQueryHandler(self.show_analysis_details, pattern="^show_details:"))
-        self.application.add_handler(CallbackQueryHandler(self.hide_analysis_details, pattern="^hide_details:"))
-        
-        # ConversationHandler для анализа
-        conv_handler = ConversationHandler(
-            entry_points=[CommandHandler('start', self.start_command), CommandHandler('analyze', self.start_analysis)],
-            states={
-                TRADE_TYPE: [CallbackQueryHandler(self.trade_type_selected)],
-                SYMBOL: [CallbackQueryHandler(self.symbol_selected), MessageHandler(filters.TEXT & ~filters.COMMAND, self.symbol_entered)],
-                TIMEFRAME: [CallbackQueryHandler(self.timeframe_selected)]
-            },
-            fallbacks=[CommandHandler('cancel', self.cancel_analysis)],
-            per_message=False,
-            per_chat=True
-        )
-        
-        self.application.add_handler(conv_handler)
-        self.application.add_handler(CommandHandler('help', self.help_command))
-        self.application.add_handler(CommandHandler('check_symbols', self.check_symbols_command))
+    def refresh_symbols(self):
+        available = set()
+        for sym in PO_ALL_SYMBOLS:
+            try:
+                # Пробуем получить хотя бы одну свечу
+                self.analyzer.get_ohlcv_data(sym, '1h', limit=1)
+                available.add(sym)
+            except Exception:
+                continue
+        self.available_symbols = available
     
-    async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработчик команды /start - сразу предлагает выбор валюты"""
-        # Клавиатура для выбора типа торговли
-        keyboard = [
-            [
-                InlineKeyboardButton("ОТС (Бинарные опционы)", callback_data="otc"),
-                InlineKeyboardButton("Обычная торговля", callback_data="regular")
-            ]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await update.message.reply_text(
-            "📈 *Выберите тип торговли:*",
-            reply_markup=reply_markup,
-            parse_mode='Markdown'
-        )
-        
-        return TRADE_TYPE
-    
-    async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработчик команды /help"""
-        help_text = """
-📚 *Справка*
-
-🔍 *Анализ:*
-1. /start или /analyze - Выберите тип торговли
-2. Выберите валютную пару или введите вручную
-3. Выберите таймфрейм
-
-💡 *Ввод валютной пары:*
-Любой формат: EUR/USD, EURUSD, eurusd, EUR USD, EUR|USD
-
-📊 *Индикаторы:*
-• SMA (50) - Тренд
-• RSI (14) - Моментум  
-• MACD - Тренд + моментум
-• Bollinger Bands - Волатильность
-• Stochastic RSI - Доп. моментум
-• Williams %R - Перекупленность/перепроданность
-• CCI - Тренд + моментум
-• ADX - Сила тренда
-• ATR - Волатильность
-• OBV - Объем
-
-🎯 *Сигналы:*
-• 🟢 ВВЕРХ - Покупка
-• 🔴 ВНИЗ - Продажа
-• 🟡 НЕЙТРАЛЬНО - Ожидание
-
-⏰ *Автоматическая проверка:*
-Бот автоматически проверит результат через выбранное время
-
-⚠️ Не является финансовой рекомендацией
-        """
-        
-        await update.message.reply_text(help_text, parse_mode='Markdown')
-    
-    async def start_analysis(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Начало процесса анализа"""
-        # Клавиатура для выбора типа торговли
-        keyboard = [
-            [
-                InlineKeyboardButton("ОТС (Бинарные опционы)", callback_data="otc"),
-                InlineKeyboardButton("Обычная торговля", callback_data="regular")
-            ]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await update.message.reply_text(
-            "📈 *Выберите тип торговли:*",
-            reply_markup=reply_markup,
-            parse_mode='Markdown'
-        )
-        
-        return TRADE_TYPE
+    async def update_symbols_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await update.message.reply_text("⏳ Обновляю список доступных пар...")
+        self.refresh_symbols()
+        if not self.available_symbols:
+            await update.message.reply_text("❌ Не удалось определить доступные пары сейчас. Попробуйте позже.")
+            return
+        lst = sorted(list(self.available_symbols))
+        text = "✅ Доступные пары (по данным источников):\n" + ", ".join(lst)
+        await update.message.reply_text(text[:4000])
     
     def _build_symbols_keyboard(self, trade_type_text: str) -> InlineKeyboardMarkup:
-        is_otc = (trade_type_text or '').lower().startswith('отс') or (trade_type_text or '').lower() == 'otc'
-        symbols = PO_ALL_SYMBOLS if is_otc else sorted(list(PO_FOREX_SYMBOLS))
+        # Используем динамически доступные пары, если есть; иначе показываем дефолтный список
+        symbols = sorted(list(self.available_symbols)) if self.available_symbols else PO_ALL_SYMBOLS
         # Формируем клавиатуру 2 кнопки в ряд
         rows = []
         row = []
@@ -834,16 +756,7 @@ class TelegramBot:
     async def symbol_entered(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик ввода символа вручную"""
         symbol = update.message.text.strip()
-        trade_text = context.user_data.get('trade_type_text') or ''
-        is_otc = (trade_text.lower().startswith('отс')) or (trade_text.lower() == 'otc')
-        # Валидация по доступности на PO
-        if not is_otc:
-            normalized = _normalize_pair_text(symbol)
-            if normalized not in PO_FOREX_SYMBOLS_NORMALIZED:
-                await update.message.reply_text(
-                    "❌ Пара недоступна для режима Forex на Pocket Option.\n\n"
-                    "Совет: выберите режим ОТС или укажите другую пару.")
-                return SYMBOL
+        # Без жёсткой блокировки: пробуем работать с тем, что ввёл пользователь
         context.user_data['symbol'] = symbol
         
         # Клавиатура для выбора таймфрейма + отмена
