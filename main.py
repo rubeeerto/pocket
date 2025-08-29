@@ -934,9 +934,13 @@ class TelegramBot:
             await query.edit_message_text(error_message, parse_mode='Markdown')
         except Exception as e:
             logger.error(f"Ошибка при анализе {symbol}: {e}")
-            error_message = f"❌ *Ошибка:*\n\n{str(e)}\n\n"
-            error_message += "🔄 /analyze - Попробовать снова\n"
-            error_message += "📚 /help - Справка"
+            # Мягкое сообщение без деталей исключения
+            error_message = (
+                "❌ *Не удалось выполнить анализ*\n\n"
+                "Пара может быть временно недоступна. Попробуйте другую пару или повторите позже.\n\n"
+                "🔄 /analyze - Попробовать снова\n"
+                "📚 /help - Справка"
+            )
             await query.edit_message_text(error_message, parse_mode='Markdown')
         
         return ConversationHandler.END
