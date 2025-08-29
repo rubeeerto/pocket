@@ -13,6 +13,7 @@ from telegram.ext import (
     ConversationHandler, MessageHandler, filters, ContextTypes
 )
 from dotenv import load_dotenv
+import yfinance as yf
 
 # Загружаем переменные окружения
 load_dotenv()
@@ -68,26 +69,65 @@ class TechnicalAnalyzer:
         })
     
     def get_ohlcv_data(self, symbol: str, timeframe: str, limit: int = 200) -> pd.DataFrame:
-        """Получение OHLCV данных"""
+        """Получение OHLCV данных с поддержкой Binance и Yahoo Finance"""
         try:
             # Преобразуем символ для совместимости с Binance
             formatted_symbol = self._format_symbol(symbol)
             logger.info(f"Запрос данных для {formatted_symbol} на {timeframe}")
-            
-            # Получаем данные с таймаутом
-            ohlcv = self.exchange.fetch_ohlcv(formatted_symbol, timeframe, limit=limit)
-            
-            if not ohlcv or len(ohlcv) == 0:
-                raise Exception(f"Нет данных для {formatted_symbol} на {timeframe}")
-            
-            # Создаем DataFrame
-            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-            df.set_index('timestamp', inplace=True)
-            
-            logger.info(f"Получено {len(df)} свечей для {formatted_symbol}")
-            return df
-            
+            # Проверяем, поддерживается ли пара на Binance
+            if self._is_binance_symbol(formatted_symbol):
+                ohlcv = self.exchange.fetch_ohlcv(formatted_symbol, timeframe, limit=limit)
+                if not ohlcv or len(ohlcv) == 0:
+                    raise Exception(f"Нет данных для {formatted_symbol} на {timeframe}")
+                df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+                df.set_index('timestamp', inplace=True)
+                logger.info(f"Получено {len(df)} свечей для {formatted_symbol} (Binance)")
+                return df
+            # Если не Binance — пробуем через Yahoo Finance
+            yf_symbol = self._format_yahoo_symbol(symbol)
+            interval = self._yahoo_timeframe_to_interval(timeframe)
+            period = self._yahoo_period_for_interval(interval)
+            data = yf.download(yf_symbol, period=period, interval=interval, progress=False)
+            # Если пусто — пробуем реверсную пару (например, USDUAH вместо UAHUSD)
+            if data.empty:
+                # Пытаемся поменять местами базу и котировку
+                normalized = symbol.upper().replace('/', '').replace(' ', '')
+                if len(normalized) >= 6:
+                    base = normalized[:3]
+                    quote = normalized[3:6]
+                    reversed_symbol = f"{quote}{base}=X"
+                    rev_data = yf.download(reversed_symbol, period=period, interval=interval, progress=False)
+                    if not rev_data.empty:
+                        # Переименуем и инвертируем OHLC
+                        rev = rev_data.rename(columns={'Open':'open','High':'high','Low':'low','Close':'close','Volume':'volume'})
+                        # Привести к float
+                        for c in ['open','high','low','close']:
+                            rev[c] = pd.to_numeric(rev[c], errors='coerce')
+                        inv = pd.DataFrame(index=rev.index)
+                        inv['open'] = 1.0 / rev['open']
+                        inv['high'] = 1.0 / rev['low']
+                        inv['low'] = 1.0 / rev['high']
+                        inv['close'] = 1.0 / rev['close']
+                        inv['volume'] = rev.get('volume', 0)
+                        data = inv
+            if data.empty:
+                raise Exception(f"Yahoo Finance не вернул данные для {yf_symbol}")
+            # Исправление для MultiIndex (yfinance для форекс)
+            if isinstance(data.columns, pd.MultiIndex):
+                # Берём только значения для тикера (обычно первый уровень)
+                data.columns = [col[0].lower() for col in data.columns]
+            # Исправление: если столбцы имеют shape (N, 1), преобразуем их в Series
+            for col in ['open', 'high', 'low', 'close', 'volume']:
+                if col in data.columns and hasattr(data[col], 'values') and len(data[col].values.shape) > 1:
+                    data[col] = data[col].values.reshape(-1)
+            data = data.rename(columns={
+                'Open': 'open', 'High': 'high', 'Low': 'low', 'Close': 'close', 'Volume': 'volume'
+            })
+            # Очистка NaN и проверка достаточности данных
+            data = data[['open','high','low','close','volume']].dropna()
+            logger.info(f"Получено {len(data)} свечей для {yf_symbol} (Yahoo Finance)")
+            return data.tail(limit)
         except Exception as e:
             logger.error(f"Ошибка при получении данных для {symbol}: {e}")
             raise Exception(f"Не удалось получить данные для {symbol}: {str(e)}")
@@ -177,6 +217,53 @@ class TechnicalAnalyzer:
         
         return normalized
     
+    def _is_binance_symbol(self, formatted_symbol: str) -> bool:
+        try:
+            markets = self.exchange.load_markets()
+            return formatted_symbol in markets
+        except Exception:
+            return False
+
+    def _format_yahoo_symbol(self, symbol: str) -> str:
+        # Преобразует EUR/USD → EURUSD=X, USDJPY → JPY=X, BTC/USDT → BTC-USD и т.д.
+        normalized = symbol.upper().replace('/', '').replace(' ', '')
+        if normalized.endswith('USD') and len(normalized) == 6:
+            return normalized[:3] + normalized[3:] + '=X'
+        if normalized.endswith('JPY') and len(normalized) == 6:
+            return normalized[:3] + normalized[3:] + '=X'
+        if 'BTC' in normalized or 'ETH' in normalized:
+            return normalized.replace('USDT', '-USD')
+        return normalized + '=X'
+
+    def _yahoo_timeframe_to_interval(self, timeframe: str) -> str:
+        # Упрощённый маппинг интервалов Yahoo: поддерживает 1m, 2m, 5m, 15m, 30m, 60m/1h, 90m, 1d
+        mapping = {
+            '1m': '1m',
+            '2m': '2m',
+            '3m': '5m',
+            '4m': '5m',
+            '5m': '5m',
+            '6m': '5m',
+            '7m': '15m',
+            '8m': '15m',
+            '9m': '15m',
+            '10m': '15m',
+            '15m': '15m',
+            '30m': '30m',
+            '1h': '1h',
+            '4h': '1h',
+            '1d': '1d'
+        }
+        return mapping.get(timeframe, '1h')
+
+    def _yahoo_period_for_interval(self, interval: str) -> str:
+        # Ограничения yfinance по максимуму периода для мелких интервалов
+        if interval == '1m':
+            return '7d'
+        if interval in ['2m', '5m', '15m', '30m', '1h']:
+            return '60d'
+        return '1y'
+    
     def calculate_indicators(self, df: pd.DataFrame) -> Dict:
         """Расчет технических индикаторов"""
         indicators = {}
@@ -184,6 +271,9 @@ class TechnicalAnalyzer:
         # SMA и EMA
         indicators['sma'] = df['close'].rolling(window=INDICATOR_CONFIG['sma_period']).mean()
         indicators['ema'] = df['close'].ewm(span=INDICATOR_CONFIG['ema_period']).mean()
+        # Дополнительные долгосрочные средние как прокси старшего ТФ
+        indicators['sma200'] = df['close'].rolling(window=200, min_periods=50).mean()
+        indicators['ema50'] = df['close'].ewm(span=50, adjust=False).mean()
         
         # RSI
         delta = df['close'].diff()
@@ -238,79 +328,149 @@ class TechnicalAnalyzer:
                 np.abs(df['low'] - df['close'].shift(1))
             )
         )
-        
         plus_di = 100 * pd.Series(plus_dm).rolling(window=INDICATOR_CONFIG['adx_period']).mean() / \
                   pd.Series(tr).rolling(window=INDICATOR_CONFIG['adx_period']).mean()
         minus_di = 100 * pd.Series(minus_dm).rolling(window=INDICATOR_CONFIG['adx_period']).mean() / \
                    pd.Series(tr).rolling(window=INDICATOR_CONFIG['adx_period']).mean()
-        
         dx = 100 * np.abs(plus_di - minus_di) / (plus_di + minus_di)
         indicators['adx'] = pd.Series(dx).rolling(window=INDICATOR_CONFIG['adx_period']).mean()
         indicators['plus_di'] = plus_di
         indicators['minus_di'] = minus_di
         
-        # ATR (Average True Range)
-        tr = np.maximum(
+        # ATR (Average True Range) и волатильность в % от цены
+        tr2 = np.maximum(
             df['high'] - df['low'],
             np.maximum(
                 np.abs(df['high'] - df['close'].shift(1)),
                 np.abs(df['low'] - df['close'].shift(1))
             )
         )
-        indicators['atr'] = pd.Series(tr).rolling(window=INDICATOR_CONFIG['atr_period']).mean()
+        indicators['atr'] = pd.Series(tr2).rolling(window=INDICATOR_CONFIG['atr_period']).mean()
+        indicators['atr_pct'] = (indicators['atr'] / df['close']) * 100
         
         # OBV (On Balance Volume)
         obv = (np.sign(df['close'].diff()) * df['volume']).fillna(0).cumsum()
         indicators['obv'] = obv.rolling(window=INDICATOR_CONFIG['obv_period']).mean()
         
+        # Уже добавленные ранее индикаторы: Parabolic SAR, Momentum, ROC, MFI, Ichimoku — оставляем как есть
+        # (логика их вычисления находится выше по коду в этом методе)
+        
+        # Свечные паттерны (простые)
+        try:
+            body = (df['close'] - df['open']).abs()
+            range_ = (df['high'] - df['low']).replace(0, np.nan)
+            upper_wick = (df[['open','close']].max(axis=1) - df['high']).abs()
+            lower_wick = (df['low'] - df[['open','close']].min(axis=1)).abs()
+            indicators['is_doji'] = (body / range_) < 0.1
+            # Пин-бар: длинный хвост снизу или сверху
+            indicators['is_bull_pin'] = (lower_wick > body * 2) & (df['close'] > df['open'])
+            indicators['is_bear_pin'] = (upper_wick > body * 2) & (df['close'] < df['open'])
+            # Поглощение
+            prev_open = df['open'].shift(1)
+            prev_close = df['close'].shift(1)
+            bull_engulf = (df['close'] > df['open']) & (prev_close < prev_open) & (df['close'] >= prev_open) & (df['open'] <= prev_close)
+            bear_engulf = (df['close'] < df['open']) & (prev_close > prev_open) & (df['close'] <= prev_open) & (df['open'] >= prev_close)
+            indicators['bull_engulf'] = bull_engulf
+            indicators['bear_engulf'] = bear_engulf
+        except Exception:
+            indicators['is_doji'] = pd.Series(False, index=df.index)
+            indicators['is_bull_pin'] = pd.Series(False, index=df.index)
+            indicators['is_bear_pin'] = pd.Series(False, index=df.index)
+            indicators['bull_engulf'] = pd.Series(False, index=df.index)
+            indicators['bear_engulf'] = pd.Series(False, index=df.index)
+        
         return indicators
     
-    def analyze_signals(self, df: pd.DataFrame) -> Dict:
+    def analyze_signals(self, df: pd.DataFrame, indicators: Dict, trade_type: Optional[str] = None) -> Dict:
         """Анализ сигналов и принятие решения"""
         try:
             # Проверяем, что у нас достаточно данных
             if len(df) < 50:
                 raise Exception("Недостаточно данных для анализа (нужно минимум 50 свечей)")
             
-            # Получаем текущие значения индикаторов
-            current_price = df['close'].iloc[-1]
-            current_sma = indicators['sma'].iloc[-1]
-            current_rsi = indicators['rsi'].iloc[-1]
-            current_macd_hist = indicators['macd_histogram'].iloc[-1]
-            current_bb_upper = indicators['bb_upper'].iloc[-1]
-            current_bb_lower = indicators['bb_lower'].iloc[-1]
-            current_stoch_rsi = indicators['stoch_rsi'].iloc[-1]
-            current_williams_r = indicators['williams_r'].iloc[-1]
-            current_cci = indicators['cci'].iloc[-1]
-            current_adx = indicators['adx'].iloc[-1]
-            current_plus_di = indicators['plus_di'].iloc[-1]
-            current_minus_di = indicators['minus_di'].iloc[-1]
-            current_atr = indicators['atr'].iloc[-1]
-            current_obv = indicators['obv'].iloc[-1]
+            # Сформировать таблицу ключевых индикаторов и выбрать последнюю валидную строку
+            key_df = pd.DataFrame({
+                'price': df['close'],
+                'sma': indicators['sma'],
+                'rsi': indicators['rsi'],
+                'macd_histogram': indicators['macd_histogram'],
+                'bb_upper': indicators['bb_upper'],
+                'bb_lower': indicators['bb_lower']
+            })
+            key_df = key_df.dropna()
+            if key_df.empty:
+                raise Exception("Недостаточно валидных данных индикаторов (все NaN). Подождите больше истории или измените таймфрейм.")
+            last_idx = key_df.index[-1]
             
-            # Проверяем, что все значения не NaN
+            # Текущие значения по последней валидной свече
+            current_price = df.loc[last_idx, 'close']
+            current_sma = indicators['sma'].loc[last_idx]
+            current_sma200 = indicators.get('sma200', pd.Series([np.nan], index=[last_idx])).loc[last_idx]
+            current_ema50 = indicators.get('ema50', pd.Series([np.nan], index=[last_idx])).loc[last_idx]
+            current_rsi = indicators['rsi'].loc[last_idx]
+            current_macd_hist = indicators['macd_histogram'].loc[last_idx]
+            current_bb_upper = indicators['bb_upper'].loc[last_idx]
+            current_bb_lower = indicators['bb_lower'].loc[last_idx]
+            current_stoch_rsi = indicators['stoch_rsi'].loc[last_idx] if 'stoch_rsi' in indicators else np.nan
+            current_williams_r = indicators['williams_r'].loc[last_idx] if 'williams_r' in indicators else np.nan
+            current_cci = indicators['cci'].loc[last_idx] if 'cci' in indicators else np.nan
+            current_adx = indicators['adx'].loc[last_idx] if 'adx' in indicators else np.nan
+            current_plus_di = indicators['plus_di'].loc[last_idx] if 'plus_di' in indicators else np.nan
+            current_minus_di = indicators['minus_di'].loc[last_idx] if 'minus_di' in indicators else np.nan
+            current_atr = indicators['atr'].loc[last_idx] if 'atr' in indicators else np.nan
+            current_atr_pct = indicators.get('atr_pct', pd.Series([np.nan], index=[last_idx])).loc[last_idx]
+            current_obv = indicators['obv'].loc[last_idx] if 'obv' in indicators else np.nan
+            
+            # Проверка NaN ключевых значений
             if pd.isna(current_price) or pd.isna(current_sma) or pd.isna(current_rsi):
-                raise Exception("Получены некорректные данные индикаторов")
+                raise Exception("Недостаточно валидных данных индикаторов на последней свече. Измените таймфрейм или дождитесь новых данных.")
             
-            # Система баллов
-            score = 0
+            # Адаптивные веса под рынки
+            is_otc = (trade_type or '').lower() == 'otc'
+            w_trend = 2.0 if not is_otc else 1.5
+            w_momentum = 1.5 if is_otc else 1.2
+            w_volatility = 1.0
+            w_patterns = 1.0
+            
+            score = 0.0
             signals = []
             
-            # Трендовые сигналы (вес: 2)
-            if current_price > current_sma:
-                score += 2
-                signals.append("Цена > SMA50 (+2)")
-            else:
-                score -= 2
-                signals.append("Цена < SMA50 (-2)")
+            # Фильтр низкой волатильности (снижаем уверенность)
+            if not pd.isna(current_atr_pct) and current_atr_pct < 0.05:
+                signals.append("Низкая волатильность ATR% (<0.05%) (-0.5)")
+                score -= 0.5
             
-            # RSI сигналы (вес: 1.5)
+            # Старший тренд (SMA200 / EMA50)
+            if not pd.isna(current_sma200):
+                if current_price > current_sma200:
+                    score += w_trend
+                    signals.append(f"Цена > SMA200 (+{w_trend})")
+                else:
+                    score -= w_trend
+                    signals.append(f"Цена < SMA200 (-{w_trend})")
+            if not pd.isna(current_ema50):
+                if current_price > current_ema50:
+                    score += 1.0
+                    signals.append("Цена > EMA50 (+1)")
+                else:
+                    score -= 1.0
+                    signals.append("Цена < EMA50 (-1)")
+            
+            # Базовый тренд (SMA50)
+            if current_price > current_sma:
+                score += w_trend
+                signals.append(f"Цена > SMA50 (+{w_trend})")
+            else:
+                score -= w_trend
+                signals.append(f"Цена < SMA50 (-{w_trend})")
+            
+            # RSI
             if 50 < current_rsi < 80:
-                score += 1.5
-                signals.append(f"RSI: {current_rsi:.1f} (+1.5)")
+                score += w_momentum
+                signals.append(f"RSI: {current_rsi:.1f} (+{w_momentum})")
             elif 20 < current_rsi < 50:
-                score -= 1.5
-                signals.append(f"RSI: {current_rsi:.1f} (-1.5)")
+                score -= w_momentum
+                signals.append(f"RSI: {current_rsi:.1f} (-{w_momentum})")
             elif current_rsi >= 80:
                 score -= 1
                 signals.append(f"RSI перекуплен: {current_rsi:.1f} (-1)")
@@ -318,15 +478,15 @@ class TechnicalAnalyzer:
                 score += 1
                 signals.append(f"RSI перепродан: {current_rsi:.1f} (+1)")
             
-            # MACD сигналы (вес: 1.5)
+            # MACD
             if current_macd_hist > 0:
-                score += 1.5
-                signals.append("MACD > 0 (+1.5)")
+                score += w_momentum
+                signals.append(f"MACD > 0 (+{w_momentum})")
             else:
-                score -= 1.5
-                signals.append("MACD < 0 (-1.5)")
+                score -= w_momentum
+                signals.append(f"MACD < 0 (-{w_momentum})")
             
-            # Bollinger Bands сигналы (вес: 1)
+            # Полосы Боллинджера
             if current_price <= current_bb_lower:
                 score += 1
                 signals.append("Цена у нижней BB (+1)")
@@ -334,7 +494,7 @@ class TechnicalAnalyzer:
                 score -= 1
                 signals.append("Цена у верхней BB (-1)")
             
-            # Stochastic RSI сигналы (вес: 1)
+            # Stochastic RSI
             if current_stoch_rsi < 20:
                 score += 1
                 signals.append(f"Stoch RSI: {current_stoch_rsi:.1f} (+1)")
@@ -342,7 +502,7 @@ class TechnicalAnalyzer:
                 score -= 1
                 signals.append(f"Stoch RSI: {current_stoch_rsi:.1f} (-1)")
             
-            # Williams %R сигналы (вес: 1)
+            # Williams %R
             if current_williams_r < -80:
                 score += 1
                 signals.append(f"Williams %R: {current_williams_r:.1f} (+1)")
@@ -350,7 +510,7 @@ class TechnicalAnalyzer:
                 score -= 1
                 signals.append(f"Williams %R: {current_williams_r:.1f} (-1)")
             
-            # CCI сигналы (вес: 1)
+            # CCI
             if current_cci > 100:
                 score += 1
                 signals.append(f"CCI: {current_cci:.1f} (+1)")
@@ -358,8 +518,8 @@ class TechnicalAnalyzer:
                 score -= 1
                 signals.append(f"CCI: {current_cci:.1f} (-1)")
             
-            # ADX сигналы (вес: 1)
-            if current_adx > 25:
+            # ADX тренд
+            if current_adx > 20:
                 if current_plus_di > current_minus_di:
                     score += 1
                     signals.append(f"ADX тренд вверх: {current_adx:.1f} (+1)")
@@ -367,66 +527,111 @@ class TechnicalAnalyzer:
                     score -= 1
                     signals.append(f"ADX тренд вниз: {current_adx:.1f} (-1)")
             
-            # ATR сигналы (вес: 0.5)
+            # ATR волатильность
             atr_avg = indicators['atr'].rolling(window=20).mean().iloc[-1]
             if current_atr > atr_avg * 1.2:
-                score += 0.5
-                signals.append("Высокая волатильность (+0.5)")
+                score += w_volatility * 0.5
+                signals.append(f"Высокая волатильность (+{0.5 * w_volatility})")
             elif current_atr < atr_avg * 0.8:
-                score -= 0.5
-                signals.append("Низкая волатильность (-0.5)")
+                score -= w_volatility * 0.5
+                signals.append(f"Низкая волатильность (-{0.5 * w_volatility})")
             
-            # OBV сигналы (вес: 0.5)
-            obv_avg = indicators['obv'].rolling(window=20).mean().iloc[-1]
-            if current_obv > obv_avg:
+            # OBV направление (приблизительное)
+            obv_slope = indicators['obv'].iloc[-1] - indicators['obv'].iloc[-5] if len(indicators['obv']) > 5 else 0
+            if obv_slope > 0:
                 score += 0.5
                 signals.append("OBV растет (+0.5)")
-            else:
+            elif obv_slope < 0:
                 score -= 0.5
                 signals.append("OBV падает (-0.5)")
             
-            # Определение итогового сигнала
-            if score >= SIGNAL_THRESHOLDS['strong_bull']:
-                signal = "ВВЕРХ 🚀"
-                strength = "СИЛЬНЫЙ"
-                sticker = "🟢"
-            elif score >= SIGNAL_THRESHOLDS['weak_bull']:
-                signal = "ВВЕРХ 📈"
-                strength = "СЛАБЫЙ"
-                sticker = "🟢"
-            elif score <= SIGNAL_THRESHOLDS['strong_bear']:
-                signal = "ВНИЗ 🐻"
-                strength = "СИЛЬНЫЙ"
-                sticker = "🔴"
-            elif score <= SIGNAL_THRESHOLDS['weak_bear']:
-                signal = "ВНИЗ 📉"
-                strength = "СЛАБЫЙ"
-                sticker = "🔴"
+            # Паттерны свечей
+            if indicators.get('bull_engulf', pd.Series([False])).iloc[-1]:
+                score += w_patterns
+                signals.append(f"Бычье поглощение (+{w_patterns})")
+            if indicators.get('bear_engulf', pd.Series([False])).iloc[-1]:
+                score -= w_patterns
+                signals.append(f"Медвежье поглощение (-{w_patterns})")
+            if indicators.get('is_bull_pin', pd.Series([False])).iloc[-1]:
+                score += 0.5
+                signals.append("Пин-бар бычий (+0.5)")
+            if indicators.get('is_bear_pin', pd.Series([False])).iloc[-1]:
+                score -= 0.5
+                signals.append("Пин-бар медвежий (-0.5)")
+            if indicators.get('is_doji', pd.Series([False])).iloc[-1]:
+                signals.append("Доджи (нейтрально)")
+            
+            # Результат и сила
+            strength = "СИЛЬНЫЙ БЫЧИЙ" if score >= SIGNAL_THRESHOLDS['strong_bull'] else \
+                       "СЛАБЫЙ БЫЧИЙ" if score >= SIGNAL_THRESHOLDS['weak_bull'] else \
+                       "СЛАБЫЙ МЕДВЕЖИЙ" if score <= SIGNAL_THRESHOLDS['weak_bear'] else \
+                       "СИЛЬНЫЙ МЕДВЕЖИЙ" if score <= SIGNAL_THRESHOLDS['strong_bear'] else "НЕЙТРАЛЬНЫЙ"
+            if strength in ["СИЛЬНЫЙ БЫЧИЙ", "СЛАБЫЙ БЫЧИЙ"]:
+                sticker = "🟢 ВВЕРХ ▲"
+            elif strength in ["СЛАБЫЙ МЕДВЕЖИЙ", "СИЛЬНЫЙ МЕДВЕЖИЙ"]:
+                sticker = "🔴 ВНИЗ ▼"
             else:
-                signal = "НЕЙТРАЛЬНО ➡️"
-                strength = "НЕЙТРАЛЬНЫЙ"
-                sticker = "🟡"
+                sticker = "🟡 НЕЙТРАЛЬНО ➡️"
             
             return {
-                'signal': signal,
+                'signal': sticker,
                 'strength': strength,
-                'score': score,
+                'score': round(float(score), 2),
                 'signals': signals,
                 'current_price': current_price,
-                'current_rsi': current_rsi,
-                'current_macd_hist': current_macd_hist,
-                'current_stoch_rsi': current_stoch_rsi,
-                'current_williams_r': current_williams_r,
-                'current_cci': current_cci,
-                'current_adx': current_adx,
-                'current_atr': current_atr,
-                'current_obv': current_obv,
-                'sticker': sticker
+                'values': {
+                    'RSI': round(float(current_rsi), 2),
+                    'MACD_hist': round(float(current_macd_hist), 6),
+                    'Williams %R': round(float(current_williams_r), 1) if not pd.isna(current_williams_r) else None,
+                    'CCI': round(float(current_cci), 1) if not pd.isna(current_cci) else None,
+                    'ADX': round(float(current_adx), 1) if not pd.isna(current_adx) else None,
+                    'ATR': round(float(current_atr), 5) if not pd.isna(current_atr) else None,
+                    'ATR%': round(float(current_atr_pct), 3) if not pd.isna(current_atr_pct) else None,
+                    'SMA200': round(float(current_sma200), 5) if not pd.isna(current_sma200) else None,
+                    'EMA50': round(float(current_ema50), 5) if not pd.isna(current_ema50) else None
+                }
             }
-            
         except Exception as e:
             logger.error(f"Ошибка при анализе сигналов: {e}")
             raise Exception(f"Ошибка анализа: {str(e)}")
+
+    def check_all_symbols(self):
+        # Список всех валютных пар из клавиатуры и маппинга
+        all_symbols = [
+            'EUR/USD', 'GBP/USD', 'USD/JPY', 'AUD/USD', 'NZD/USD', 'USD/CAD', 'USD/CHF',
+            'AUD/JPY', 'EUR/JPY', 'GBP/JPY', 'CAD/JPY', 'CHF/JPY', 'EUR/GBP', 'AUD/CAD',
+            'NZD/JPY', 'EURAUD', 'GBPAUD', 'AUDNZD', 'EURNZD', 'GBPNZD', 'GBPCHF', 'EURCHF', 'AUDCHF', 'CADCHF', 'NZDCHF',
+            'BTC/USDT', 'ETH/USDT'
+        ]
+        available = []
+        unavailable = []
+        for symbol in all_symbols:
+            try:
+                # Пробуем получить хотя бы одну свечу (1h)
+                self.get_ohlcv_data(symbol, '1h', limit=1)
+                available.append(symbol)
+            except Exception as e:
+                unavailable.append(f"{symbol} ({e})")
+        logger.info(f"Доступные пары: {', '.join(available)}")
+        if unavailable:
+            logger.warning(f"Недоступные пары: {', '.join(unavailable)}")
+
+PO_FOREX_SYMBOLS = {
+    'EUR/USD', 'GBP/USD', 'USD/JPY', 'AUD/USD', 'NZD/USD', 'USD/CAD', 'USD/CHF',
+    'AUD/JPY', 'EUR/JPY', 'GBP/JPY', 'CAD/JPY', 'CHF/JPY'
+}
+# Нормализованный вид разрешенных форекс-пар (без разделителей)
+PO_FOREX_SYMBOLS_NORMALIZED = {s.replace('/', '').upper() for s in PO_FOREX_SYMBOLS}
+
+PO_ALL_SYMBOLS = [
+    'EUR/USD', 'GBP/USD', 'USD/JPY', 'AUD/USD', 'NZD/USD', 'USD/CAD', 'USD/CHF',
+    'AUD/JPY', 'EUR/JPY', 'GBP/JPY', 'CAD/JPY', 'CHF/JPY', 'EUR/GBP', 'AUD/CAD',
+    'NZD/JPY', 'EURAUD', 'GBPAUD', 'AUDNZD', 'EURNZD', 'GBPNZD', 'GBPCHF', 'EURCHF', 'AUDCHF', 'CADCHF', 'NZDCHF',
+    'BTC/USDT', 'ETH/USDT'
+]
+
+def _normalize_pair_text(pair: str) -> str:
+    return pair.upper().replace('/', '').replace(' ', '')
 
 class TelegramBot:
     """Основной класс Telegram бота"""
@@ -441,12 +646,19 @@ class TelegramBot:
         self.check_tasks = {}
         # Путь к папке с изображениями
         self.images_path = "images/"
+        # Задачи анализа по user_id
+        self.analysis_tasks = {}
+        # Проверка всех валютных пар при старте
+        self.analyzer.check_all_symbols()
     
     def setup_handlers(self):
         """Настройка обработчиков команд"""
         
         # Обработчик для отмены анализа во время выполнения (должен быть ПЕРЕД ConversationHandler)
         self.application.add_handler(CallbackQueryHandler(self.cancel_analysis_during, pattern="^cancel_analysis$"))
+        # Кнопки переключения подробностей
+        self.application.add_handler(CallbackQueryHandler(self.show_analysis_details, pattern="^show_details:"))
+        self.application.add_handler(CallbackQueryHandler(self.hide_analysis_details, pattern="^hide_details:"))
         
         # ConversationHandler для анализа
         conv_handler = ConversationHandler(
@@ -463,6 +675,7 @@ class TelegramBot:
         
         self.application.add_handler(conv_handler)
         self.application.add_handler(CommandHandler('help', self.help_command))
+        self.application.add_handler(CommandHandler('check_symbols', self.check_symbols_command))
     
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик команды /start - сразу предлагает выбор валюты"""
@@ -540,6 +753,22 @@ class TelegramBot:
         
         return TRADE_TYPE
     
+    def _build_symbols_keyboard(self, trade_type_text: str) -> InlineKeyboardMarkup:
+        is_otc = (trade_type_text or '').lower().startswith('отс') or (trade_type_text or '').lower() == 'otc'
+        symbols = PO_ALL_SYMBOLS if is_otc else sorted(list(PO_FOREX_SYMBOLS))
+        # Формируем клавиатуру 2 кнопки в ряд
+        rows = []
+        row = []
+        for s in symbols:
+            row.append(InlineKeyboardButton(s, callback_data=s))
+            if len(row) == 2:
+                rows.append(row)
+                row = []
+        if row:
+            rows.append(row)
+        rows.append([InlineKeyboardButton("✏️ Ввести вручную", callback_data="manual_input")])
+        return InlineKeyboardMarkup(rows)
+    
     async def trade_type_selected(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик выбора типа торговли"""
         query = update.callback_query
@@ -551,53 +780,8 @@ class TelegramBot:
         trade_text = "ОТС (Бинарные опционы)" if trade_type == "otc" else "Обычная торговля"
         context.user_data['trade_type_text'] = trade_text
         
-        # Клавиатура для выбора валютной пары
-        keyboard = [
-            [
-                InlineKeyboardButton("EUR/USD", callback_data="EUR/USD"),
-                InlineKeyboardButton("GBP/USD", callback_data="GBP/USD")
-            ],
-            [
-                InlineKeyboardButton("USD/JPY", callback_data="USD/JPY"),
-                InlineKeyboardButton("AUD/USD", callback_data="AUD/USD")
-            ],
-            [
-                InlineKeyboardButton("NZD/USD", callback_data="NZD/USD"),
-                InlineKeyboardButton("USD/CAD", callback_data="USD/CAD")
-            ],
-            [
-                InlineKeyboardButton("USD/CHF", callback_data="USD/CHF"),
-                InlineKeyboardButton("AUD/JPY", callback_data="AUD/JPY")
-            ],
-            [
-                InlineKeyboardButton("EUR/JPY", callback_data="EUR/JPY"),
-                InlineKeyboardButton("GBP/JPY", callback_data="GBP/JPY")
-            ],
-            [
-                InlineKeyboardButton("CAD/JPY", callback_data="CAD/JPY"),
-                InlineKeyboardButton("CHF/JPY", callback_data="CHF/JPY")
-            ],
-            [
-                InlineKeyboardButton("EUR/AUD", callback_data="EUR/AUD"),
-                InlineKeyboardButton("GBP/AUD", callback_data="GBP/AUD")
-            ],
-            [
-                InlineKeyboardButton("AUD/NZD", callback_data="AUD/NZD"),
-                InlineKeyboardButton("EUR/NZD", callback_data="EUR/NZD")
-            ],
-            [
-                InlineKeyboardButton("GBP/NZD", callback_data="GBP/NZD"),
-                InlineKeyboardButton("GBP/CHF", callback_data="GBP/CHF")
-            ],
-            [
-                InlineKeyboardButton("EUR/CHF", callback_data="EUR/CHF"),
-                InlineKeyboardButton("AUD/CHF", callback_data="AUD/CHF")
-            ],
-            [
-                InlineKeyboardButton("✏️ Ввести вручную", callback_data="manual_input")
-            ]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
+        # Клавиатура для выбора валютной пары с учетом доступности на Pocket Option
+        reply_markup = self._build_symbols_keyboard(trade_text)
         
         await query.edit_message_text(
             f"🎯 *Выберите валютную пару:*\n\nТип: {trade_text}\n\nИли введите вручную в любом формате:",
@@ -629,27 +813,13 @@ class TelegramBot:
         symbol = query.data
         context.user_data['symbol'] = symbol
         
-        # Клавиатура для выбора таймфрейма
+        # Клавиатура для выбора таймфрейма + отмена
         keyboard = [
-            [
-                InlineKeyboardButton("1m", callback_data="1m"),
-                InlineKeyboardButton("2m", callback_data="2m"),
-                InlineKeyboardButton("3m", callback_data="3m")
-            ],
-            [
-                InlineKeyboardButton("4m", callback_data="4m"),
-                InlineKeyboardButton("5m", callback_data="5m"),
-                InlineKeyboardButton("6m", callback_data="6m")
-            ],
-            [
-                InlineKeyboardButton("7m", callback_data="7m"),
-                InlineKeyboardButton("8m", callback_data="8m"),
-                InlineKeyboardButton("9m", callback_data="9m")
-            ],
-            [
-                InlineKeyboardButton("10m", callback_data="10m"),
-                InlineKeyboardButton("15m", callback_data="15m")
-            ]
+            [InlineKeyboardButton("1m", callback_data="1m"), InlineKeyboardButton("2m", callback_data="2m"), InlineKeyboardButton("3m", callback_data="3m")],
+            [InlineKeyboardButton("4m", callback_data="4m"), InlineKeyboardButton("5m", callback_data="5m"), InlineKeyboardButton("6m", callback_data="6m")],
+            [InlineKeyboardButton("7m", callback_data="7m"), InlineKeyboardButton("8m", callback_data="8m"), InlineKeyboardButton("9m", callback_data="9m")],
+            [InlineKeyboardButton("10m", callback_data="10m"), InlineKeyboardButton("15m", callback_data="15m")],
+            [InlineKeyboardButton("❌ Отменить", callback_data="cancel_analysis")]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
@@ -664,29 +834,25 @@ class TelegramBot:
     async def symbol_entered(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик ввода символа вручную"""
         symbol = update.message.text.strip()
+        trade_text = context.user_data.get('trade_type_text') or ''
+        is_otc = (trade_text.lower().startswith('отс')) or (trade_text.lower() == 'otc')
+        # Валидация по доступности на PO
+        if not is_otc:
+            normalized = _normalize_pair_text(symbol)
+            if normalized not in PO_FOREX_SYMBOLS_NORMALIZED:
+                await update.message.reply_text(
+                    "❌ Пара недоступна для режима Forex на Pocket Option.\n\n"
+                    "Совет: выберите режим ОТС или укажите другую пару.")
+                return SYMBOL
         context.user_data['symbol'] = symbol
         
-        # Клавиатура для выбора таймфрейма
+        # Клавиатура для выбора таймфрейма + отмена
         keyboard = [
-            [
-                InlineKeyboardButton("1m", callback_data="1m"),
-                InlineKeyboardButton("2m", callback_data="2m"),
-                InlineKeyboardButton("3m", callback_data="3m")
-            ],
-            [
-                InlineKeyboardButton("4m", callback_data="4m"),
-                InlineKeyboardButton("5m", callback_data="5m"),
-                InlineKeyboardButton("6m", callback_data="6m")
-            ],
-            [
-                InlineKeyboardButton("7m", callback_data="7m"),
-                InlineKeyboardButton("8m", callback_data="8m"),
-                InlineKeyboardButton("9m", callback_data="9m")
-            ],
-            [
-                InlineKeyboardButton("10m", callback_data="10m"),
-                InlineKeyboardButton("15m", callback_data="15m")
-            ]
+            [InlineKeyboardButton("1m", callback_data="1m"), InlineKeyboardButton("2m", callback_data="2m"), InlineKeyboardButton("3m", callback_data="3m")],
+            [InlineKeyboardButton("4m", callback_data="4m"), InlineKeyboardButton("5m", callback_data="5m"), InlineKeyboardButton("6m", callback_data="6m")],
+            [InlineKeyboardButton("7m", callback_data="7m"), InlineKeyboardButton("8m", callback_data="8m"), InlineKeyboardButton("9m", callback_data="9m")],
+            [InlineKeyboardButton("10m", callback_data="10m"), InlineKeyboardButton("15m", callback_data="15m")],
+            [InlineKeyboardButton("❌ Отменить", callback_data="cancel_analysis")]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
@@ -727,49 +893,51 @@ class TelegramBot:
         
         try:
             logger.info(f"Начинаем анализ {symbol} на {timeframe} для пользователя {update.effective_user.id}")
-            
-            # Выполняем анализ
-            result = await self.perform_analysis(symbol, timeframe)
+            user_id = update.effective_user.id
+            # Если уже есть задача анализа для пользователя — отменяем её
+            prev_task = self.analysis_tasks.get(user_id)
+            if prev_task and not prev_task.done():
+                prev_task.cancel()
+            # Запускаем новую задачу анализа
+            analysis_task = asyncio.create_task(self.perform_analysis(symbol, timeframe, context.user_data.get('trade_type')))
+            self.analysis_tasks[user_id] = analysis_task
+            result = await analysis_task
             
             logger.info(f"Анализ {symbol} завершен успешно")
             
-            # Сохраняем прогноз для проверки
-            forecast_id = f"{symbol}_{timeframe}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-            self.forecasts[forecast_id] = {
-                'symbol': symbol,
-                'timeframe': timeframe,
-                'trade_type': trade_type,
-                'prediction': result['signal'],
-                'score': result['score'],
-                'current_price': result['current_price'],
-                'timestamp': datetime.now(),
-                'user_id': update.effective_user.id,
-                'chat_id': update.effective_chat.id,
-                'message_id': query.message.message_id
-            }
+            # Формируем подробности и определяем нейтральность
+            details = self.format_analysis_details(result)
+            is_neutral = 'НЕЙТРАЛЬНО' in result['signal'].upper()
+            forecast_id = None
             
-            # Формируем ответ
-            response = self.format_analysis_result(symbol, timeframe, result, trade_type)
-            
-            # Получаем изображение для сигнала
-            image_path = self.get_image_for_signal(result['signal'])
-            
-            if image_path and os.path.exists(image_path):
-                # Отправляем с изображением
-                with open(image_path, 'rb') as photo:
-                    await query.edit_message_text(response, parse_mode='Markdown')
-                    await self.application.bot.send_photo(
-                        chat_id=update.effective_chat.id,
-                        photo=photo,
-                        caption="📊 Анализ завершен"
-                    )
+            # Если прогноз не нейтральный — сохраняем прогноз и тексты для переключения
+            if not is_neutral:
+                forecast_id = f"{symbol}_{timeframe}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                # Формируем краткую сводку и клавиатуру
+                summary_text, reply_markup = self.format_analysis_result(symbol, timeframe, result, trade_type, forecast_id, details)
+                self.forecasts[forecast_id] = {
+                    'symbol': symbol,
+                    'timeframe': timeframe,
+                    'trade_type': trade_type,
+                    'prediction': result['signal'],
+                    'score': result['score'],
+                    'current_price': result['current_price'],
+                    'timestamp': datetime.now(),
+                    'user_id': update.effective_user.id,
+                    'chat_id': update.effective_chat.id,
+                    'message_id': query.message.message_id,
+                    'details': details,
+                    'summary': summary_text
+                }
+                await query.edit_message_text(summary_text, parse_mode='Markdown', reply_markup=reply_markup)
+                # Автопроверка только для не нейтральных
+                await self.schedule_forecast_check(forecast_id, timeframe, update.effective_user.id)
             else:
-                # Отправляем без изображения
-                await query.edit_message_text(response, parse_mode='Markdown')
+                # Для нейтральных — без forecast_id, без кнопки и без автопроверки
+                summary_text, _ = self.format_analysis_result(symbol, timeframe, result, trade_type, None, details)
+                await query.edit_message_text(summary_text, parse_mode='Markdown', reply_markup=None)
             
-            # Запускаем автоматическую проверку через время таймфрейма
-            await self.schedule_forecast_check(forecast_id, timeframe, update.effective_user.id)
-            
+            # Лог
             logger.info(f"Результат анализа отправлен пользователю {update.effective_user.id}")
             
         except asyncio.TimeoutError:
@@ -974,7 +1142,7 @@ class TelegramBot:
         except:
             return None
     
-    async def perform_analysis(self, symbol: str, timeframe: str) -> Dict:
+    async def perform_analysis(self, symbol: str, timeframe: str, trade_type: Optional[str] = None) -> Dict:
         """Выполнение технического анализа"""
         try:
             # Получаем данные с таймаутом
@@ -991,67 +1159,70 @@ class TelegramBot:
             
             # Анализируем сигналы с таймаутом
             analysis_result = await asyncio.wait_for(
-                asyncio.to_thread(self.analyzer.analyze_signals, df, indicators),
+                asyncio.to_thread(self.analyzer.analyze_signals, df, indicators, trade_type),
                 timeout=10.0  # 10 секунд таймаут
             )
             
             return analysis_result
-            
-        except asyncio.TimeoutError:
-            logger.error(f"Таймаут при анализе {symbol} на {timeframe}")
-            raise Exception("Превышено время ожидания при анализе. Попробуйте позже.")
+        except asyncio.CancelledError:
+            logger.info(f"Анализ {symbol} на {timeframe} отменён пользователем")
+            raise
         except Exception as e:
             logger.error(f"Ошибка при анализе {symbol}: {e}")
             raise
     
-    def format_analysis_result(self, symbol: str, timeframe: str, result: Dict, trade_type: str) -> str:
-        """Форматирование результата анализа"""
-        response = f"""
-📊 *РЕЗУЛЬТАТ АНАЛИЗА*
+    def format_analysis_result(self, symbol: str, timeframe: str, result: Dict, trade_type: str, forecast_id: str = None, details: str = None) -> (str, InlineKeyboardMarkup):
+        # Краткий результат
+        main = f"📊 *РЕЗУЛЬТАТ АНАЛИЗА*\n\n"
+        main += f"🎯 Актив: {symbol}\n⏰ Таймфрейм: {timeframe}\nТип: {trade_type}\n\n"
+        main += f"🚨 ПРОГНОЗ: {result['signal']}\n💪 Сила сигнала: {result['strength']}\n📈 Общий балл: {result['score']}\n\n"
+        if forecast_id:
+            main += f"⏰ Автоматическая проверка через {timeframe}\n\n"
+        main += "⚠️ Только для информационных целей\nНе является финансовой рекомендацией\nТорговля связана с рисками\n\n"
+        main += "🔄 /analyze - Новый анализ\n"
+        reply_markup = None
+        if forecast_id:
+            reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton("Подробнее", callback_data=f"show_details:{forecast_id}")]])
+        return main, reply_markup
 
-🎯 *Валютная пара:* {symbol}
-⏰ *Таймфрейм:* {timeframe}
-📈 *Тип:* {trade_type}
-🕐 *Время:* {datetime.now().strftime('%H:%M:%S')}
+    def format_analysis_details(self, result: Dict) -> str:
+        # Формирует подробное обоснование и значения индикаторов
+        details = "📋 Обоснование:\n" + "\n".join([f"• {s}" for s in result.get('signals', [])])
+        details += "\n\n📊 Значения:\n"
+        for k, v in result.get('values', {}).items():
+            details += f"• {k}: {v}\n"
+        details += "\n========================="
+        return details
+    
+    async def show_analysis_details(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        await query.answer()
+        forecast_id = query.data.split(':')[1] if ':' in query.data else None
+        forecast = self.forecasts.get(forecast_id)
+        if not forecast:
+            await query.answer("Детали недоступны", show_alert=True)
+            return
+        details = forecast.get('details')
+        if not details:
+            await query.answer("Нет подробностей", show_alert=True)
+            return
+        close_markup = InlineKeyboardMarkup([[InlineKeyboardButton("Закрыть", callback_data=f"hide_details:{forecast_id}")]])
+        await query.edit_message_text(details, parse_mode='Markdown', reply_markup=close_markup)
 
-{'='*25}
-
-{result['sticker']} *ПРОГНОЗ:* {result['signal']}
-💪 *Сила:* {result['strength']}
-📊 *Балл:* {result['score']}
-
-{'='*25}
-
-📋 *Обоснование:*
-"""
-        
-        for signal in result['signals']:
-            response += f"• {signal}\n"
-        
-        response += f"""
-
-📊 *Значения:*
-• Цена: {result['current_price']:.5f}
-• RSI: {result['current_rsi']:.1f}
-• MACD: {result['current_macd_hist']:.6f}
-• Williams %R: {result['current_williams_r']:.1f}
-• CCI: {result['current_cci']:.1f}
-• ADX: {result['current_adx']:.1f}
-• ATR: {result['current_atr']:.5f}
-
-{'='*25}
-
-⏰ *Автоматическая проверка через {timeframe}*
-
-⚠️ *Предупреждение:*
-Только для информационных целей
-Не является финансовой рекомендацией
-Торговля связана с рисками
-
-🔄 /analyze - Новый анализ
-        """
-        
-        return response
+    async def hide_analysis_details(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        await query.answer()
+        forecast_id = query.data.split(':')[1] if ':' in query.data else None
+        forecast = self.forecasts.get(forecast_id)
+        if not forecast:
+            await query.answer("Нет данных", show_alert=True)
+            return
+        summary = forecast.get('summary')
+        if not summary:
+            await query.answer("Сводка недоступна", show_alert=True)
+            return
+        more_markup = InlineKeyboardMarkup([[InlineKeyboardButton("Подробнее", callback_data=f"show_details:{forecast_id}")]])
+        await query.edit_message_text(summary, parse_mode='Markdown', reply_markup=more_markup)
     
     async def cancel_analysis(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Отмена анализа"""
@@ -1073,6 +1244,13 @@ class TelegramBot:
             if hasattr(context, 'user_data'):
                 context.user_data.clear()
                 logger.info("Состояние пользователя очищено")
+            # Отменяем задачу анализа, если есть
+            user_id = update.effective_user.id
+            analysis_task = self.analysis_tasks.get(user_id)
+            if analysis_task and not analysis_task.done():
+                analysis_task.cancel()
+            if user_id in self.analysis_tasks:
+                del self.analysis_tasks[user_id]
             
             # Убираем клавиатуру
             await query.edit_message_text(
@@ -1103,6 +1281,26 @@ class TelegramBot:
                 )
         
         return ConversationHandler.END
+    
+    async def check_symbols_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        all_symbols = [
+            'EUR/USD', 'GBP/USD', 'USD/JPY', 'AUD/USD', 'NZD/USD', 'USD/CAD', 'USD/CHF',
+            'AUD/JPY', 'EUR/JPY', 'GBP/JPY', 'CAD/JPY', 'CHF/JPY', 'EUR/GBP', 'AUD/CAD',
+            'NZD/JPY', 'EURAUD', 'GBPAUD', 'AUDNZD', 'EURNZD', 'GBPNZD', 'GBPCHF', 'EURCHF', 'AUDCHF', 'CADCHF', 'NZDCHF',
+            'BTC/USDT', 'ETH/USDT'
+        ]
+        available = []
+        unavailable = []
+        for symbol in all_symbols:
+            try:
+                self.analyzer.get_ohlcv_data(symbol, '1h', limit=1)
+                available.append(symbol)
+            except Exception as e:
+                unavailable.append(f"{symbol} ({str(e)[:40]})")
+        msg = f"✅ Доступные пары ({len(available)}):\n" + ", ".join(available)
+        if unavailable:
+            msg += f"\n\n❌ Недоступные пары ({len(unavailable)}):\n" + "\n".join(unavailable)
+        await update.message.reply_text(msg[:4000])
     
     def run(self):
         """Запуск бота"""
