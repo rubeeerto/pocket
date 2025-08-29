@@ -111,6 +111,53 @@ class TechnicalAnalyzer:
                         inv['close'] = 1.0 / rev['close']
                         inv['volume'] = rev.get('volume', 0)
                         data = inv
+            # Синтетический кросс через USD, если прямой и обратный отсутствуют
+            if data.empty:
+                normalized = symbol.upper().replace('/', '').replace(' ', '')
+                if len(normalized) >= 6:
+                    base = normalized[:3]
+                    quote = normalized[3:6]
+                    def _yf_load_pair(ticker: str) -> pd.DataFrame:
+                        dfp = yf.download(ticker, period=period, interval=interval, progress=False)
+                        if dfp.empty:
+                            return dfp
+                        if isinstance(dfp.columns, pd.MultiIndex):
+                            dfp.columns = [col[0] for col in dfp.columns]
+                        dfp = dfp.rename(columns={'Open':'open','High':'high','Low':'low','Close':'close','Volume':'volume'})
+                        for c in ['open','high','low','close']:
+                            if c in dfp:
+                                dfp[c] = pd.to_numeric(dfp[c], errors='coerce')
+                        return dfp[['open','high','low','close','volume']].dropna()
+                    def _usd_per(code: str) -> pd.DataFrame:
+                        # Пытаемся получить USD/CODE, иначе CODE/USD и инвертируем
+                        direct = _yf_load_pair(f"USD{code}=X")
+                        if not direct.empty:
+                            return direct
+                        inverse = _yf_load_pair(f"{code}USD=X")
+                        if not inverse.empty:
+                            inv = pd.DataFrame(index=inverse.index)
+                            inv['open'] = 1.0 / inverse['open']
+                            inv['high'] = 1.0 / inverse['low']
+                            inv['low'] = 1.0 / inverse['high']
+                            inv['close'] = 1.0 / inverse['close']
+                            inv['volume'] = inverse.get('volume', 0)
+                            return inv
+                        return pd.DataFrame()
+                    usd_per_base = _usd_per(base)
+                    usd_per_quote = _usd_per(quote) if quote != 'CNH' else (_usd_per('CNY') if _usd_per('CNH').empty else _usd_per('CNH'))
+                    if not usd_per_base.empty and not usd_per_quote.empty:
+                        idx = usd_per_base.index.intersection(usd_per_quote.index)
+                        if len(idx) > 0:
+                            ub = usd_per_base.loc[idx]
+                            uq = usd_per_quote.loc[idx]
+                            syn = pd.DataFrame(index=idx)
+                            # BASE/QUOTE = (USD/QUOTE) / (USD/BASE)
+                            syn['open'] = uq['open'] / ub['open']
+                            syn['high'] = uq['high'] / ub['high']
+                            syn['low'] = uq['low'] / ub['low']
+                            syn['close'] = uq['close'] / ub['close']
+                            syn['volume'] = 0
+                            data = syn.dropna()
             if data.empty:
                 raise Exception(f"Yahoo Finance не вернул данные для {yf_symbol}")
             # Исправление для MultiIndex (yfinance для форекс)
