@@ -618,7 +618,7 @@ class TechnicalAnalyzer:
 
 PO_FOREX_SYMBOLS = {
     'EUR/USD', 'GBP/USD', 'USD/JPY', 'AUD/USD', 'NZD/USD', 'USD/CAD', 'USD/CHF',
-    'EUR/JPY', 'GBP/JPY', 'AUD/JPY', 'CAD/JPY', 'CHF/JPY',
+    'AUD/JPY', 'EUR/JPY', 'GBP/JPY', 'CAD/JPY', 'CHF/JPY',
     'EUR/CAD'
 }
 # Нормализованный вид разрешенных форекс-пар (без разделителей)
@@ -653,6 +653,31 @@ class TelegramBot:
         self.available_symbols = set()
         # Проверка всех валютных пар при старте
         self.refresh_symbols()
+    
+    def setup_handlers(self):
+        """Регистрация всех обработчиков бота"""
+        # Инлайн-кнопки
+        self.application.add_handler(CallbackQueryHandler(self.cancel_analysis_during, pattern="^cancel_analysis$"))
+        self.application.add_handler(CallbackQueryHandler(self.show_analysis_details, pattern="^show_details:"))
+        self.application.add_handler(CallbackQueryHandler(self.hide_analysis_details, pattern="^hide_details:"))
+        
+        # Команды
+        self.application.add_handler(CommandHandler('help', self.help_command))
+        self.application.add_handler(CommandHandler('upd', self.update_symbols_command))
+        
+        # Основной диалог анализа
+        conv_handler = ConversationHandler(
+            entry_points=[CommandHandler('start', self.start_command), CommandHandler('analyze', self.start_analysis)],
+            states={
+                TRADE_TYPE: [CallbackQueryHandler(self.trade_type_selected)],
+                SYMBOL: [CallbackQueryHandler(self.symbol_selected), MessageHandler(filters.TEXT & ~filters.COMMAND, self.symbol_entered)],
+                TIMEFRAME: [CallbackQueryHandler(self.timeframe_selected)]
+            },
+            fallbacks=[CommandHandler('cancel', self.cancel_analysis)],
+            per_message=False,
+            per_chat=True
+        )
+        self.application.add_handler(conv_handler)
     
     def refresh_symbols(self):
         available = set()
