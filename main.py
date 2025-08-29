@@ -985,48 +985,52 @@ class TelegramBot:
     async def check_forecast_result(self, forecast: Dict) -> Dict:
         """Проверка результата прогноза"""
         try:
-            # Получаем текущие данные
-            current_df = self.analyzer.get_ohlcv_data(forecast['symbol'], forecast['timeframe'], limit=1)
-            current_price = current_df['close'].iloc[-1]
+            # Получаем текущие данные (последняя валидная свеча на момент проверки)
+            current_df = self.analyzer.get_ohlcv_data(forecast['symbol'], forecast['timeframe'], limit=5)
+            current_df = current_df.dropna()
+            if current_df.empty:
+                raise Exception("Нет валидных данных для проверки")
+            current_close = current_df['close'].iloc[-1]
             
-            # Цена открытия (когда был сделан прогноз)
-            open_price = forecast['current_price']
+            # Цена открытия из момента прогноза
+            open_price = float(forecast['current_price'])
+            close_price = float(current_close)
             
-            # Определяем результат
-            if "ВВЕРХ" in forecast['prediction']:
-                # Прогноз был на рост
-                if current_price > open_price:
-                    result = "✅ ПЛЮС"
-                    points = current_price - open_price
-                else:
-                    result = "❌ МИНУС"
-                    points = open_price - current_price
-            elif "ВНИЗ" in forecast['prediction']:
-                # Прогноз был на падение
-                if current_price < open_price:
-                    result = "✅ ПЛЮС"
-                    points = open_price - current_price
-                else:
-                    result = "❌ МИНУС"
-                    points = current_price - open_price
+            # Единые правила пунктов без исключений: вычисляем динамически по масштабу цены
+            # Если цена крупная (>= 20), шаг пункта 0.01, иначе 0.0001 (универсально и просто)
+            pip_size = 0.01 if max(open_price, close_price) >= 20 else 0.0001
+            points_abs = abs(close_price - open_price) / pip_size
+            
+            # Определение результата согласно направлению
+            direction_up = "ВВЕРХ" in (forecast['prediction'] or "")
+            direction_down = "ВНИЗ" in (forecast['prediction'] or "")
+            went_up = close_price > open_price
+            
+            if direction_up:
+                prediction_correct = went_up
+            elif direction_down:
+                prediction_correct = not went_up
             else:
-                result = "➡️ НЕЙТРАЛЬНО"
-                points = 0
+                # Нейтральный прогноз не оцениваем как плюс/минус
+                prediction_correct = False
+            
+            result = "✅ ПЛЮС" if prediction_correct else ("❌ МИНУС" if (direction_up or direction_down) else "➡️ НЕЙТРАЛЬНО")
             
             return {
                 'result': result,
                 'open_price': open_price,
-                'close_price': current_price,
-                'points': points,
-                'prediction_correct': "ПЛЮС" in result
+                'close_price': close_price,
+                'points': round(points_abs, 2),
+                'prediction_correct': prediction_correct
             }
             
         except Exception as e:
-            logger.error(f"Ошибка при проверке результата: {e}")
+            logger.error(f"Ошибка при проверке прогноза: {e}")
+            # Возвращаем мягкий результат без падения
             return {
-                'result': "❌ ОШИБКА",
-                'open_price': forecast['current_price'],
-                'close_price': 0,
+                'result': "⚠️ НЕТ ДАННЫХ",
+                'open_price': forecast.get('current_price', None),
+                'close_price': None,
                 'points': 0,
                 'prediction_correct': False
             }
