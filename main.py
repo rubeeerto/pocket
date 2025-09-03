@@ -49,12 +49,12 @@ INDICATOR_CONFIG = {
     'obv_period': 20
 }
 
-# Пороги для принятия решений
+# Пороги для принятия решений (снижены для более четких сигналов)
 SIGNAL_THRESHOLDS = {
-    'strong_bull': 8,
-    'weak_bull': 4,
-    'weak_bear': -4,
-    'strong_bear': -8
+    'strong_bull': 3,
+    'weak_bull': 1,
+    'weak_bear': -1,
+    'strong_bear': -3
 }
 
 class TechnicalAnalyzer:
@@ -608,17 +608,27 @@ class TechnicalAnalyzer:
             if indicators.get('is_doji', pd.Series([False])).iloc[-1]:
                 signals.append("Доджи (нейтрально)")
             
-            # Результат и сила
-            strength = "СИЛЬНЫЙ БЫЧИЙ" if score >= SIGNAL_THRESHOLDS['strong_bull'] else \
-                       "СЛАБЫЙ БЫЧИЙ" if score >= SIGNAL_THRESHOLDS['weak_bull'] else \
-                       "СЛАБЫЙ МЕДВЕЖИЙ" if score <= SIGNAL_THRESHOLDS['weak_bear'] else \
-                       "СИЛЬНЫЙ МЕДВЕЖИЙ" if score <= SIGNAL_THRESHOLDS['strong_bear'] else "НЕЙТРАЛЬНЫЙ"
-            if strength in ["СИЛЬНЫЙ БЫЧИЙ", "СЛАБЫЙ БЫЧИЙ"]:
+            # Результат и сила (убираем нейтральные - всегда выбираем направление)
+            if score >= SIGNAL_THRESHOLDS['strong_bull']:
+                strength = "СИЛЬНЫЙ БЫЧИЙ"
                 sticker = "🟢 ВВЕРХ ▲"
-            elif strength in ["СЛАБЫЙ МЕДВЕЖИЙ", "СИЛЬНЫЙ МЕДВЕЖИЙ"]:
+            elif score >= SIGNAL_THRESHOLDS['weak_bull']:
+                strength = "СЛАБЫЙ БЫЧИЙ"
+                sticker = "🟢 ВВЕРХ ▲"
+            elif score <= SIGNAL_THRESHOLDS['strong_bear']:
+                strength = "СИЛЬНЫЙ МЕДВЕЖИЙ"
+                sticker = "🔴 ВНИЗ ▼"
+            elif score <= SIGNAL_THRESHOLDS['weak_bear']:
+                strength = "СЛАБЫЙ МЕДВЕЖИЙ"
                 sticker = "🔴 ВНИЗ ▼"
             else:
-                sticker = "🟡 НЕЙТРАЛЬНО ➡️"
+                # Если между порогами - выбираем по знаку
+                if score > 0:
+                    strength = "СЛАБЫЙ БЫЧИЙ"
+                    sticker = "🟢 ВВЕРХ ▲"
+                else:
+                    strength = "СЛАБЫЙ МЕДВЕЖИЙ"
+                    sticker = "🔴 ВНИЗ ▼"
             
             return {
                 'signal': sticker,
@@ -770,11 +780,11 @@ class TelegramBot:
         if best_prediction:
             # Форматируем результат лучшего прогноза
             result_text = f"🏆 ЛУЧШИЙ ПРОГНОЗ НАЙДЕН!\n\n"
-            result_text += f"💱 Пара: {best_prediction['symbol']}\n"
-            result_text += f"⏰ Таймфрейм: {best_prediction['timeframe']}\n"
+            result_text += f"💱 Пара: `{best_prediction['symbol']}`\n"
+            result_text += f"⏰ Таймфрейм: `{best_prediction['timeframe']}`\n"
             result_text += f"📈 Прогноз: {best_prediction['prediction']}\n"
             result_text += f"🎯 Уверенность: {best_prediction['confidence']:.1f}%\n"
-            result_text += f"💰 Текущая цена: {best_prediction['current_price']}\n\n"
+            result_text += f"💰 Текущая цена: `{best_prediction['current_price']}`\n\n"
             result_text += f"📋 Обоснование:\n{best_prediction['justification']}\n\n"
             result_text += f"⚠️ Предупреждение:\nТолько для информационных целей\nНе является финансовой рекомендацией\nТорговля связана с рисками"
             
@@ -813,9 +823,9 @@ class TelegramBot:
                         # Логируем для отладки
                         logger.info(f"Анализ {symbol} {timeframe}: {prediction}, confidence={confidence}, score={score}, combined={combined_score}")
                         
-                        # Выбираем лучший прогноз (включая нейтральные, но с приоритетом не нейтральных)
-                        if prediction != "НЕЙТРАЛЬНО":
-                            combined_score += 10  # Бонус за не нейтральный прогноз
+                        # Выбираем лучший прогноз (только не нейтральные)
+                        if "НЕЙТРАЛЬНО" not in prediction:
+                            combined_score += 5  # Бонус за четкий прогноз
                         
                         if combined_score > best_score:
                             best_score = combined_score
@@ -982,7 +992,7 @@ class TelegramBot:
             
             # Формируем подробности и определяем нейтральность
             details = self.format_analysis_details(result)
-            is_neutral = 'НЕЙТРАЛЬНО' in result['signal'].upper()
+            is_neutral = 'НЕЙТРАЛЬНО' in result['signal'].upper() or 'НЕЙТРАЛЬНЫЙ' in result['signal'].upper()
             forecast_id = None
             
             # Если прогноз не нейтральный — сохраняем прогноз и тексты для переключения
@@ -1257,7 +1267,7 @@ class TelegramBot:
     def format_analysis_result(self, symbol: str, timeframe: str, result: Dict, trade_type: str, forecast_id: str = None, details: str = None) -> (str, InlineKeyboardMarkup):
         # Краткий результат
         main = f"📊 *РЕЗУЛЬТАТ АНАЛИЗА*\n\n"
-        main += f"🎯 Актив: {symbol}\n⏰ Таймфрейм: {timeframe}\nТип: {trade_type}\n\n"
+        main += f"🎯 Актив: `{symbol}`\n⏰ Таймфрейм: `{timeframe}`\nТип: {trade_type}\n\n"
         main += f"🚨 ПРОГНОЗ: {result['signal']}\n💪 Сила сигнала: {result['strength']}\n📈 Общий балл: {result['score']}\n\n"
         if forecast_id:
             main += f"⏰ Автоматическая проверка через {timeframe}\n\n"
