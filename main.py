@@ -74,7 +74,7 @@ class TechnicalAnalyzer:
             # Преобразуем символ для совместимости с Binance
             formatted_symbol = self._format_symbol(symbol)
             logger.info(f"Запрос данных для {formatted_symbol} на {timeframe}")
-                        # Проверяем, поддерживается ли пара на Binance
+            # Проверяем, поддерживается ли пара на Binance
             if self._is_binance_symbol(formatted_symbol):
                 ohlcv = self.exchange.fetch_ohlcv(formatted_symbol, timeframe, limit=limit)
                 if not ohlcv or len(ohlcv) == 0:
@@ -780,11 +780,11 @@ class TelegramBot:
         if best_prediction:
             # Форматируем результат лучшего прогноза
             result_text = f"🏆 ЛУЧШИЙ ПРОГНОЗ НАЙДЕН!\n\n"
-            result_text += f"💱 Пара: `{best_prediction['symbol']}`\n"
-            result_text += f"⏰ Таймфрейм: `{best_prediction['timeframe']}`\n"
+            result_text += f"💱 Пара: {best_prediction['symbol']}\n"
+            result_text += f"⏰ Таймфрейм: {best_prediction['timeframe']}\n"
             result_text += f"📈 Прогноз: {best_prediction['prediction']}\n"
             result_text += f"🎯 Уверенность: {best_prediction['confidence']:.1f}%\n"
-            result_text += f"💰 Текущая цена: `{best_prediction['current_price']}`\n\n"
+            result_text += f"💰 Текущая цена: {best_prediction['current_price']}\n\n"
             result_text += f"📋 Обоснование:\n{best_prediction['justification']}\n\n"
             result_text += f"⚠️ Предупреждение:\nТолько для информационных целей\nНе является финансовой рекомендацией\nТорговля связана с рисками"
             
@@ -1000,23 +1000,23 @@ class TelegramBot:
                 forecast_id = f"{symbol}_{timeframe}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
                 # Формируем краткую сводку и клавиатуру
                 summary_text, reply_markup = self.format_analysis_result(symbol, timeframe, result, trade_type, forecast_id, details)
-                self.forecasts[forecast_id] = {
-                    'symbol': symbol,
-                    'timeframe': timeframe,
-                    'trade_type': trade_type,
-                    'prediction': result['signal'],
-                    'score': result['score'],
-                    'current_price': result['current_price'],
-                    'timestamp': datetime.now(),
-                    'user_id': update.effective_user.id,
-                    'chat_id': update.effective_chat.id,
-                    'message_id': query.message.message_id,
-                    'details': details,
-                    'summary': summary_text
-                }
-                await query.edit_message_text(summary_text, parse_mode='Markdown', reply_markup=reply_markup)
-                # Автопроверка только для не нейтральных
-                await self.schedule_forecast_check(forecast_id, timeframe, update.effective_user.id)
+            self.forecasts[forecast_id] = {
+                'symbol': symbol,
+                'timeframe': timeframe,
+                'trade_type': trade_type,
+                'prediction': result['signal'],
+                'score': result['score'],
+                'current_price': result['current_price'],
+                'timestamp': datetime.now(),
+                'user_id': update.effective_user.id,
+                'chat_id': update.effective_chat.id,
+                'message_id': query.message.message_id,
+                'details': details,
+                'summary': summary_text
+            }
+            await query.edit_message_text(summary_text, parse_mode='Markdown', reply_markup=reply_markup)
+            # Автопроверка только для не нейтральных
+            await self.schedule_forecast_check(forecast_id, timeframe, update.effective_user.id)
             else:
                 # Для нейтральных — без forecast_id, без кнопки и без автопроверки
                 summary_text, _ = self.format_analysis_result(symbol, timeframe, result, trade_type, None, details)
@@ -1110,7 +1110,7 @@ class TelegramBot:
                 prediction_correct = went_up
             elif direction_down:
                 prediction_correct = not went_up
-            else:
+                else:
                 # Нейтральный прогноз не оцениваем как плюс/минус
                 prediction_correct = False
             
@@ -1267,7 +1267,7 @@ class TelegramBot:
     def format_analysis_result(self, symbol: str, timeframe: str, result: Dict, trade_type: str, forecast_id: str = None, details: str = None) -> (str, InlineKeyboardMarkup):
         # Краткий результат
         main = f"📊 *РЕЗУЛЬТАТ АНАЛИЗА*\n\n"
-        main += f"🎯 Актив: `{symbol}`\n⏰ Таймфрейм: `{timeframe}`\nТип: {trade_type}\n\n"
+        main += f"🎯 Актив: {symbol}\n⏰ Таймфрейм: {timeframe}\nТип: {trade_type}\n\n"
         main += f"🚨 ПРОГНОЗ: {result['signal']}\n💪 Сила сигнала: {result['strength']}\n📈 Общий балл: {result['score']}\n\n"
         if forecast_id:
             main += f"⏰ Автоматическая проверка через {timeframe}\n\n"
