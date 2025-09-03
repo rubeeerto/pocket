@@ -761,6 +761,9 @@ class TelegramBot:
         
         await update.message.reply_text(f"📊 Найдено {len(self.available_symbols)} пар. Начинаю анализ...")
         
+        # Логируем доступные пары для отладки
+        logger.info(f"Доступные пары для анализа: {list(self.available_symbols)}")
+        
         # Анализируем все доступные пары
         best_prediction = await self.analyze_all_pairs()
         
@@ -777,23 +780,29 @@ class TelegramBot:
             
             await update.message.reply_text(result_text)
         else:
-            await update.message.reply_text("❌ Не удалось найти подходящий прогноз среди всех пар.")
+            await update.message.reply_text("❌ Не удалось найти подходящий прогноз среди всех пар.\n\nВозможные причины:\n• Все прогнозы нейтральные\n• Ошибки получения данных\n• Недостаточно данных для анализа\n\nПопробуйте команду /analyze для анализа конкретной пары.")
 
     async def analyze_all_pairs(self) -> Dict:
         """Анализ всех доступных пар и выбор лучшего прогноза"""
         best_prediction = None
         best_score = -float('inf')
+        analyzed_count = 0
+        successful_count = 0
         
         # Анализируем каждую пару на разных таймфреймах
         timeframes = ['1m', '5m', '15m', '30m', '1h', '4h', '1d']
         
-        for symbol in self.available_symbols:
+        for symbol in list(self.available_symbols)[:10]:  # Ограничиваем для тестирования
             for timeframe in timeframes:
                 try:
+                    analyzed_count += 1
                     # Выполняем анализ
                     result = await self.perform_analysis(symbol, timeframe, "Forex")
                     
-                    if result and result.get('prediction') and result['prediction'] != "НЕЙТРАЛЬНО":
+                    if result and result.get('signal'):
+                        successful_count += 1
+                        prediction = result['signal']
+                        
                         # Рассчитываем общий балл уверенности
                         confidence = result.get('confidence', 0)
                         score = result.get('total_score', 0)
@@ -801,12 +810,19 @@ class TelegramBot:
                         # Комбинированный балл: уверенность + общий балл
                         combined_score = confidence + (score * 0.1)
                         
+                        # Логируем для отладки
+                        logger.info(f"Анализ {symbol} {timeframe}: {prediction}, confidence={confidence}, score={score}, combined={combined_score}")
+                        
+                        # Выбираем лучший прогноз (включая нейтральные, но с приоритетом не нейтральных)
+                        if prediction != "НЕЙТРАЛЬНО":
+                            combined_score += 10  # Бонус за не нейтральный прогноз
+                        
                         if combined_score > best_score:
                             best_score = combined_score
                             best_prediction = {
                                 'symbol': symbol,
                                 'timeframe': timeframe,
-                                'prediction': result['prediction'],
+                                'prediction': prediction,
                                 'confidence': confidence,
                                 'current_price': result.get('current_price', 'N/A'),
                                 'justification': result.get('justification', ''),
@@ -815,9 +831,10 @@ class TelegramBot:
                             }
                             
                 except Exception as e:
-                    logger.debug(f"Ошибка анализа {symbol} {timeframe}: {e}")
+                    logger.error(f"Ошибка анализа {symbol} {timeframe}: {e}")
                     continue
         
+        logger.info(f"Проанализировано {analyzed_count} комбинаций, успешно {successful_count}, лучший балл: {best_score}")
         return best_prediction
     
     def _build_symbols_keyboard(self, trade_type_text: str) -> InlineKeyboardMarkup:
