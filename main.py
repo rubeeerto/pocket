@@ -711,6 +711,7 @@ class TelegramBot:
         # Команды
         self.application.add_handler(CommandHandler('help', self.help_command))
         self.application.add_handler(CommandHandler('upd', self.update_symbols_command))
+        self.application.add_handler(CommandHandler('search', self.search_command))
         
         # Основной диалог анализа
         conv_handler = ConversationHandler(
@@ -746,6 +747,78 @@ class TelegramBot:
         lst = sorted(list(self.available_symbols))
         text = "✅ Доступные пары (по данным источников):\n" + ", ".join(lst)
         await update.message.reply_text(text[:4000])
+
+    async def search_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Команда для поиска лучшего прогноза среди всех пар"""
+        await update.message.reply_text("🔍 Поиск лучшего прогноза среди всех пар...\n\n⏳ Обновление списка доступных пар...")
+        
+        # Сначала обновляем список символов
+        self.refresh_symbols()
+        
+        if not self.available_symbols:
+            await update.message.reply_text("❌ Не удалось найти доступные пары для анализа.")
+            return
+        
+        await update.message.reply_text(f"📊 Найдено {len(self.available_symbols)} пар. Начинаю анализ...")
+        
+        # Анализируем все доступные пары
+        best_prediction = await self.analyze_all_pairs()
+        
+        if best_prediction:
+            # Форматируем результат лучшего прогноза
+            result_text = f"🏆 ЛУЧШИЙ ПРОГНОЗ НАЙДЕН!\n\n"
+            result_text += f"💱 Пара: {best_prediction['symbol']}\n"
+            result_text += f"⏰ Таймфрейм: {best_prediction['timeframe']}\n"
+            result_text += f"📈 Прогноз: {best_prediction['prediction']}\n"
+            result_text += f"🎯 Уверенность: {best_prediction['confidence']:.1f}%\n"
+            result_text += f"💰 Текущая цена: {best_prediction['current_price']}\n\n"
+            result_text += f"📋 Обоснование:\n{best_prediction['justification']}\n\n"
+            result_text += f"⚠️ Предупреждение:\nТолько для информационных целей\nНе является финансовой рекомендацией\nТорговля связана с рисками"
+            
+            await update.message.reply_text(result_text)
+        else:
+            await update.message.reply_text("❌ Не удалось найти подходящий прогноз среди всех пар.")
+
+    async def analyze_all_pairs(self) -> Dict:
+        """Анализ всех доступных пар и выбор лучшего прогноза"""
+        best_prediction = None
+        best_score = -float('inf')
+        
+        # Анализируем каждую пару на разных таймфреймах
+        timeframes = ['1m', '5m', '15m', '30m', '1h', '4h', '1d']
+        
+        for symbol in self.available_symbols:
+            for timeframe in timeframes:
+                try:
+                    # Выполняем анализ
+                    result = await self.perform_analysis(symbol, timeframe, "Forex")
+                    
+                    if result and result.get('prediction') and result['prediction'] != "НЕЙТРАЛЬНО":
+                        # Рассчитываем общий балл уверенности
+                        confidence = result.get('confidence', 0)
+                        score = result.get('total_score', 0)
+                        
+                        # Комбинированный балл: уверенность + общий балл
+                        combined_score = confidence + (score * 0.1)
+                        
+                        if combined_score > best_score:
+                            best_score = combined_score
+                            best_prediction = {
+                                'symbol': symbol,
+                                'timeframe': timeframe,
+                                'prediction': result['prediction'],
+                                'confidence': confidence,
+                                'current_price': result.get('current_price', 'N/A'),
+                                'justification': result.get('justification', ''),
+                                'total_score': score,
+                                'combined_score': combined_score
+                            }
+                            
+                except Exception as e:
+                    logger.debug(f"Ошибка анализа {symbol} {timeframe}: {e}")
+                    continue
+        
+        return best_prediction
     
     def _build_symbols_keyboard(self, trade_type_text: str) -> InlineKeyboardMarkup:
         # Используем динамически доступные пары, если есть; иначе показываем дефолтный список
@@ -1302,6 +1375,7 @@ class TelegramBot:
             "Команды:\n"
             "• /start — начать\n"
             "• /analyze — анализ\n"
+            "• /search — найти лучший прогноз среди всех пар\n"
             "• /upd — обновить список доступных пар\n"
             "• /cancel — отменить текущий анализ\n\n"
             "Подсказки:\n"
