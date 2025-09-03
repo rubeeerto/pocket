@@ -74,7 +74,7 @@ class TechnicalAnalyzer:
             # Преобразуем символ для совместимости с Binance
             formatted_symbol = self._format_symbol(symbol)
             logger.info(f"Запрос данных для {formatted_symbol} на {timeframe}")
-            # Проверяем, поддерживается ли пара на Binance
+                        # Проверяем, поддерживается ли пара на Binance
             if self._is_binance_symbol(formatted_symbol):
                 ohlcv = self.exchange.fetch_ohlcv(formatted_symbol, timeframe, limit=limit)
                 if not ohlcv or len(ohlcv) == 0:
@@ -88,7 +88,7 @@ class TechnicalAnalyzer:
             yf_symbol = self._format_yahoo_symbol(symbol)
             interval = self._yahoo_timeframe_to_interval(timeframe)
             period = self._yahoo_period_for_interval(interval)
-            data = yf.download(yf_symbol, period=period, interval=interval, progress=False)
+            data = yf.download(yf_symbol, period=period, interval=interval, progress=False, auto_adjust=False)
             # Если пусто — пробуем реверсную пару (например, USDUAH вместо UAHUSD)
             if data.empty:
                 # Пытаемся поменять местами базу и котировку
@@ -97,7 +97,7 @@ class TechnicalAnalyzer:
                     base = normalized[:3]
                     quote = normalized[3:6]
                     reversed_symbol = f"{quote}{base}=X"
-                    rev_data = yf.download(reversed_symbol, period=period, interval=interval, progress=False)
+                    rev_data = yf.download(reversed_symbol, period=period, interval=interval, progress=False, auto_adjust=False)
                     if not rev_data.empty:
                         # Переименуем и инвертируем OHLC
                         rev = rev_data.rename(columns={'Open':'open','High':'high','Low':'low','Close':'close','Volume':'volume'})
@@ -118,7 +118,7 @@ class TechnicalAnalyzer:
                     base = normalized[:3]
                     quote = normalized[3:6]
                     def _yf_load_pair(ticker: str) -> pd.DataFrame:
-                        dfp = yf.download(ticker, period=period, interval=interval, progress=False)
+                        dfp = yf.download(ticker, period=period, interval=interval, progress=False, auto_adjust=False)
                         if dfp.empty:
                             return dfp
                         if isinstance(dfp.columns, pd.MultiIndex):
@@ -973,16 +973,16 @@ class TelegramBot:
                 forecast_id = f"{symbol}_{timeframe}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
                 # Формируем краткую сводку и клавиатуру
                 summary_text, reply_markup = self.format_analysis_result(symbol, timeframe, result, trade_type, forecast_id, details)
-                self.forecasts[forecast_id] = {
-                    'symbol': symbol,
-                    'timeframe': timeframe,
-                    'trade_type': trade_type,
-                    'prediction': result['signal'],
-                    'score': result['score'],
-                    'current_price': result['current_price'],
-                    'timestamp': datetime.now(),
-                    'user_id': update.effective_user.id,
-                    'chat_id': update.effective_chat.id,
+            self.forecasts[forecast_id] = {
+                'symbol': symbol,
+                'timeframe': timeframe,
+                'trade_type': trade_type,
+                'prediction': result['signal'],
+                'score': result['score'],
+                'current_price': result['current_price'],
+                'timestamp': datetime.now(),
+                'user_id': update.effective_user.id,
+                'chat_id': update.effective_chat.id,
                     'message_id': query.message.message_id,
                     'details': details,
                     'summary': summary_text
@@ -1083,7 +1083,7 @@ class TelegramBot:
                 prediction_correct = went_up
             elif direction_down:
                 prediction_correct = not went_up
-            else:
+                else:
                 # Нейтральный прогноз не оцениваем как плюс/минус
                 prediction_correct = False
             
