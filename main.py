@@ -973,16 +973,16 @@ class TelegramBot:
                 forecast_id = f"{symbol}_{timeframe}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
                 # Формируем краткую сводку и клавиатуру
                 summary_text, reply_markup = self.format_analysis_result(symbol, timeframe, result, trade_type, forecast_id, details)
-            self.forecasts[forecast_id] = {
-                'symbol': symbol,
-                'timeframe': timeframe,
-                'trade_type': trade_type,
-                'prediction': result['signal'],
-                'score': result['score'],
-                'current_price': result['current_price'],
-                'timestamp': datetime.now(),
-                'user_id': update.effective_user.id,
-                'chat_id': update.effective_chat.id,
+                self.forecasts[forecast_id] = {
+                    'symbol': symbol,
+                    'timeframe': timeframe,
+                    'trade_type': trade_type,
+                    'prediction': result['signal'],
+                    'score': result['score'],
+                    'current_price': result['current_price'],
+                    'timestamp': datetime.now(),
+                    'user_id': update.effective_user.id,
+                    'chat_id': update.effective_chat.id,
                     'message_id': query.message.message_id,
                     'details': details,
                     'summary': summary_text
@@ -1083,7 +1083,7 @@ class TelegramBot:
                 prediction_correct = went_up
             elif direction_down:
                 prediction_correct = not went_up
-                else:
+            else:
                 # Нейтральный прогноз не оцениваем как плюс/минус
                 prediction_correct = False
             
